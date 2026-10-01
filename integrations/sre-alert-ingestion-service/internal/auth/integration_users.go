@@ -35,6 +35,16 @@ import (
 // same integration_users rows.
 const keyLen = 32
 
+// minIterations and maxIterations bound a row's iterations before it drives a
+// PBKDF2 derivation. alerts-core's cmd/user always writes Iterations (10000);
+// a value outside this range is never legitimate and is rejected rather than
+// handed to pbkdf2.Key, which would either error or burn disproportionate CPU
+// per request — wrong secrets are never cached, so every guess re-derives.
+const (
+	minIterations = 1_000
+	maxIterations = 200_000
+)
+
 // IntegrationUsers verifies webhooks against alerts-core's integration_users table.
 // Any enabled, unexpired row with a matching secret authenticates any vendor; the
 // table is the single place both services provision and rotate credentials.
@@ -53,7 +63,8 @@ type IntegrationUsers struct {
 
 // cacheEntry holds the digest of a secret already verified for username, so a
 // repeat presentation costs one SHA-256 instead of a read plus PBKDF2. The raw
-// secret is never stored.
+// secret is never stored. expires is capped at the row's expires_at, so a
+// credential can never be served from cache past its own expiry.
 type cacheEntry struct {
 	digest  [32]byte
 	expires time.Time
@@ -98,6 +109,9 @@ func (a *IntegrationUsers) Authenticate(r *http.Request, _ string) error {
 	if err != nil || !enabled {
 		return ErrUnauthorized
 	}
+	if iterations < minIterations || iterations > maxIterations {
+		return ErrUnauthorized
+	}
 	// Cosmos DB round-trips an unset expires_at as the Unix epoch, not a zero time.
 	if !expiresAt.IsZero() && expiresAt.After(time.Unix(0, 0)) && time.Now().After(expiresAt) {
 		return ErrUnauthorized
@@ -105,7 +119,7 @@ func (a *IntegrationUsers) Authenticate(r *http.Request, _ string) error {
 	if !verifySecret(secret, salt, hash, iterations) {
 		return ErrUnauthorized
 	}
-	a.remember(username, secret)
+	a.remember(username, secret, expiresAt)
 	return nil
 }
 
@@ -124,15 +138,25 @@ func (a *IntegrationUsers) cachedHit(username, secret string) bool {
 	return subtle.ConstantTimeCompare(got[:], e.digest[:]) == 1
 }
 
-func (a *IntegrationUsers) remember(username, secret string) {
+// remember caches secret for username, capping the cache entry at rowExpiresAt
+// (if set) so an expired row can never be served from cache after expiring —
+// only the TTL window shrinks the cache's own staleness, not the row's validity.
+// Disabling a user or rotating its secret still takes up to cacheTTL to be
+// reflected, since neither changes expires_at; operators needing immediate
+// revocation should set auth.cache_ttl to 0 to disable caching.
+func (a *IntegrationUsers) remember(username, secret string, rowExpiresAt time.Time) {
 	if a.cacheTTL <= 0 {
 		return
+	}
+	expires := time.Now().Add(a.cacheTTL)
+	if !rowExpiresAt.IsZero() && rowExpiresAt.After(time.Unix(0, 0)) && rowExpiresAt.Before(expires) {
+		expires = rowExpiresAt
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cache[username] = cacheEntry{
 		digest:  sha256.Sum256([]byte(secret)),
-		expires: time.Now().Add(a.cacheTTL),
+		expires: expires,
 	}
 }
 
